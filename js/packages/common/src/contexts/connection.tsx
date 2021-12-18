@@ -8,6 +8,7 @@ import {
   Blockhash,
   clusterApiUrl,
   Commitment,
+  ConfirmOptions,
   Connection,
   FeeCalculator,
   Keypair,
@@ -15,9 +16,9 @@ import {
   SignatureStatus,
   SimulatedTransactionResponse,
   Transaction,
+  TransactionError,
   TransactionInstruction,
   TransactionSignature,
-  sendAndConfirmRawTransaction,
 } from '@solana/web3.js';
 import React, {
   ReactNode,
@@ -76,8 +77,11 @@ interface ConnectionConfig {
 
 const ConnectionContext = React.createContext<ConnectionConfig>({
   endpoint: DEFAULT,
-  setEndpoint: () => { },
-  connection: new Connection(DEFAULT, { commitment: 'recent', confirmTransactionInitialTimeout:  DEFAULT_CONNECTION_TIMEOUT }),
+  setEndpoint: () => {},
+  connection: new Connection(DEFAULT, {
+    commitment: 'recent',
+    confirmTransactionInitialTimeout: DEFAULT_CONNECTION_TIMEOUT,
+  }),
   env: ENDPOINTS[0].name,
   tokens: [],
   tokenMap: new Map<string, TokenInfo>(),
@@ -100,7 +104,11 @@ export function ConnectionProvider({
   const endpoint = queryEndpoint || savedEndpoint;
 
   const connection = useMemo(
-    () => new Connection(endpoint, { commitment: 'recent', confirmTransactionInitialTimeout: DEFAULT_CONNECTION_TIMEOUT }),
+    () =>
+      new Connection(endpoint, {
+        commitment: 'recent',
+        confirmTransactionInitialTimeout: DEFAULT_CONNECTION_TIMEOUT,
+      }),
     [endpoint],
   );
 
@@ -116,7 +124,7 @@ export function ConnectionProvider({
         .excludeByTag('nft')
         .filterByChainId(
           ENDPOINTS.find(end => end.endpoint === endpoint)?.ChainId ||
-          ChainId.MainnetBeta,
+            ChainId.MainnetBeta,
         )
         .getList();
 
@@ -136,7 +144,7 @@ export function ConnectionProvider({
   useEffect(() => {
     const id = connection.onAccountChange(
       Keypair.generate().publicKey,
-      () => { },
+      () => {},
     );
     return () => {
       connection.removeAccountChangeListener(id);
@@ -286,8 +294,9 @@ export const sendTransactions = async (
   signersSet: Keypair[][],
   sequenceType: SequenceType = SequenceType.Parallel,
   commitment: Commitment = 'singleGossip',
-  successCallback: (txid: string, ind: number) => void = () => { },
-  failCallback: (reason: string, ind: number) => boolean = () => false,
+  successCallback: (txid: string, ind: number) => void = () => {},
+  failCallback: (err: SendAndConfirmError, ind: number) => boolean = () =>
+    false,
   block?: BlockhashAndFeeCalculator,
 ): Promise<number> => {
   if (!wallet.publicKey) throw new WalletNotConnectedError();
@@ -324,7 +333,7 @@ export const sendTransactions = async (
 
   const signedTxns = await wallet.signAllTransactions(unsignedTxns);
 
-  const pendingTxns: Promise<{ txid: string; slot: number }>[] = [];
+  const pendingTxns: Promise<SendSignedTransactionResult>[] = [];
 
   const breakEarlyObject = { breakEarly: false, i: 0 };
   console.log(
@@ -340,12 +349,17 @@ export const sendTransactions = async (
     });
 
     signedTxnPromise
-      .then(({ txid }) => {
+      .then(res => {
+        if (res.err) {
+          failCallback(res.err, i);
+          throw new Error(`Instructions set ${i} failed: ${res.err.type}`);
+        }
+
+        const { txid } = res;
         console.log(`Instructions set ${i} succeeded. Transaction Id ${txid}`);
         successCallback(txid, i);
       })
-      .catch((e) => {
-        failCallback(e.message, i);
+      .catch(() => {
         console.log(`Instructions set ${i} failed.`);
         if (sequenceType === SequenceType.StopOnFailure) {
           breakEarlyObject.breakEarly = true;
@@ -368,7 +382,7 @@ export const sendTransactions = async (
     }
   }
 
-  if (sequenceType !== SequenceType.Parallel) {
+  if (pendingTxns.length) {
     await Promise.all(pendingTxns);
   }
 
@@ -464,7 +478,7 @@ export const sendTransactionWithRetry = async (
   includesFeePayer: boolean = false,
   block?: BlockhashAndFeeCalculator,
   beforeSend?: () => void,
-): Promise<{ txid: string, slot: number }> => {
+): Promise<SendSignedTransactionResult> => {
   if (!wallet.publicKey) throw new WalletNotConnectedError();
 
   let transaction = new Transaction();
@@ -494,12 +508,10 @@ export const sendTransactionWithRetry = async (
     beforeSend();
   }
 
-  const { txid, slot } = await sendSignedTransaction({
+  return await sendSignedTransaction({
     connection,
     signedTransaction: transaction,
   });
-
-  return { txid, slot };
 };
 
 export const getUnixTs = () => {
@@ -508,30 +520,77 @@ export const getUnixTs = () => {
 
 const DEFAULT_TIMEOUT = 30000;
 
+export type SendAndConfirmError =
+  | { type: 'tx-error'; inner: TransactionError; txid: TransactionSignature }
+  | { type: 'misc-error'; inner: unknown; txid?: TransactionSignature };
+
+/** Mirror of web3.js's `sendAndConfirmRawTransaction`, but with better errors. */
+export async function sendAndConfirmRawTransactionEx(
+  connection: Connection,
+  rawTransaction: Buffer,
+  options?: ConfirmOptions,
+): Promise<
+  | { ok: TransactionSignature; err?: undefined }
+  | { ok?: undefined; err: SendAndConfirmError }
+> {
+  let txid: string | undefined;
+
+  try {
+    const sendOptions = options && {
+      skipPreflight: options.skipPreflight,
+      preflightCommitment: options.preflightCommitment || options.commitment,
+    };
+
+    txid = await connection.sendRawTransaction(rawTransaction, sendOptions);
+
+    const status = (
+      await connection.confirmTransaction(txid, options && options.commitment)
+    ).value;
+
+    if (status.err) {
+      return { err: { type: 'tx-error', inner: status.err, txid } };
+    }
+
+    return { ok: txid };
+  } catch (e) {
+    return { err: { type: 'misc-error', inner: e, txid } };
+  }
+}
+
+export type SendSignedTransactionResult =
+  | { txid: string; slot: number; err?: undefined }
+  | { txid?: undefined; err: SendAndConfirmError };
+
 export async function sendSignedTransaction({
   signedTransaction,
   connection,
 }: {
   signedTransaction: Transaction;
   connection: Connection;
-  sendingMessage?: string;
-  sentMessage?: string;
-  successMessage?: string;
-  timeout?: number;
-}): Promise<{ txid: string; slot: number }> {
+  // sendingMessage?: string;
+  // sentMessage?: string;
+  // successMessage?: string;
+  // timeout?: number;
+}): Promise<SendSignedTransactionResult> {
   const rawTransaction = signedTransaction.serialize();
   let slot = 0;
 
-  const txid = await sendAndConfirmRawTransaction(
+  const result = await sendAndConfirmRawTransactionEx(
     connection,
     rawTransaction,
     {
       skipPreflight: true,
-      commitment: 'confirmed'
-    }
+      commitment: 'confirmed',
+    },
   );
 
-  const confirmation = await connection.getConfirmedTransaction(txid, 'confirmed');
+  if (result.err) return { err: result.err };
+
+  const { ok: txid } = result;
+  const confirmation = await connection.getConfirmedTransaction(
+    txid,
+    'confirmed',
+  );
 
   if (confirmation) {
     slot = confirmation.slot;

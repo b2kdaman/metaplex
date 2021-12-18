@@ -17,6 +17,7 @@ import {
   processAuctions,
   VAULT_ID,
   processVaultData,
+  SendAndConfirmError,
 } from '@oyster/common';
 import Bugsnag from '@bugsnag/browser';
 import {
@@ -27,7 +28,7 @@ import { useWallet } from '@solana/wallet-adapter-react';
 import { LAMPORTS_PER_SOL, SystemProgram } from '@solana/web3.js';
 import { Button, Col, Row, Space, Steps } from 'antd';
 import BN from 'bn.js';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useHistory, useParams } from 'react-router-dom';
 import {
   createAuctionManager,
@@ -135,7 +136,7 @@ export const AuctionCreateView = () => {
   const mint = useMint(QUOTE_MINT);
   const { width } = useWindowDimensions();
   const [percentComplete, setPercentComplete] = useState(0);
-  const [rejection, setRejection] = useState<string>()
+  let [rejection, setRejection] = useState<SendAndConfirmError | undefined>();
   const [step, setStep] = useState<number>(1);
   const [stepsVisible, setStepsVisible] = useState<boolean>(true);
   const [auctionObj, setAuctionObj] = useState<
@@ -176,8 +177,8 @@ export const AuctionCreateView = () => {
       },
       {
         programId: VAULT_ID,
-        processAccount: processVaultData
-      }
+        processAccount: processVaultData,
+      },
     );
   }, [connection]);
 
@@ -193,7 +194,9 @@ export const AuctionCreateView = () => {
 
   const createAuction = async () => {
     let winnerLimit: WinnerLimit;
-    let auctionInfo: { vault: string, auction: string, auctionManager: string } | undefined;
+    let auctionInfo:
+      | { vault: string; auction: string; auctionManager: string }
+      | undefined;
 
     if (
       attributes.category === AuctionCategory.InstantSale &&
@@ -500,28 +503,53 @@ export const AuctionCreateView = () => {
     const participationSafetyDepositDraft = isOpenEdition
       ? attributes.items[0]
       : attributes.participationNFT;
-    
+
+    const txid = prompt('Txid?') ?? '';
+    const tx = await connection.getTransaction(txid, { commitment: 'confirmed' });
+
+    console.log({ txid, tx });
+
+    if (tx?.meta?.err) {
+      rejection = { type: 'tx-error', inner: tx.meta.err, txid };
+    } else {
+      rejection = {
+        type: 'misc-error',
+        inner: tx?.transaction.message ?? 'transaction had no error',
+      };
+    }
+
+    rejection = rejection ?? { type: 'misc-error', inner: 'frick' };
+    setRejection(rejection);
+
     try {
-      auctionInfo = await createAuctionManager(
-        connection,
-        wallet,
-        setPercentComplete,
-        setRejection,
-        whitelistedCreatorsByCreator,
-        auctionSettings,
-        safetyDepositDrafts,
-        participationSafetyDepositDraft,
-        QUOTE_MINT.toBase58(),
-        storeIndexer,
-      );
+      if (false as boolean) {
+        auctionInfo = await createAuctionManager(
+          connection,
+          wallet,
+          setPercentComplete,
+          setRejection,
+          whitelistedCreatorsByCreator,
+          auctionSettings,
+          safetyDepositDrafts,
+          participationSafetyDepositDraft,
+          QUOTE_MINT.toBase58(),
+          storeIndexer,
+        );
+      }
     } catch (e: any) {
-      setRejection(e.message);
+      setRejection(r => r ?? { type: 'misc-error', inner: e });
       Bugsnag.notify(e);
-      return;  
+    }
+
+    if (rejection) {
+      Bugsnag.notify({
+        name: 'createAuctionManager failure',
+        message: JSON.stringify(rejection),
+      });
+      return;
     }
 
     try {
-
       track('new_listing', {
         category: 'creation',
         label: isInstantSale ? 'instant sale' : 'auction',

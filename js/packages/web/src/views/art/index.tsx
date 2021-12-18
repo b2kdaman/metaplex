@@ -163,8 +163,11 @@ export const ArtView = () => {
                               setValidating(true);
 
                               try {
-                                const txid = await sendSignMetadata(connection, wallet, id);
+                                const res = await sendSignMetadata(connection, wallet, id);
 
+                                if (res.err) throw res.err.inner;
+
+                                const { txid } = res;
                                 const tx = await connection.getTransaction(txid, {
                                   commitment: 'confirmed',
                                 });
