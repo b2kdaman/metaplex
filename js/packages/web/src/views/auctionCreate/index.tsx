@@ -504,12 +504,18 @@ export const AuctionCreateView = () => {
       ? attributes.items[0]
       : attributes.participationNFT;
 
+    // Track useState updates across this callback for rejection
+    let tmpRejection = rejection;
+
     try {
       auctionInfo = await createAuctionManager(
         connection,
         wallet,
         setPercentComplete,
-        setRejection,
+        rej => {
+          setRejection(rej);
+          tmpRejection = rej;
+        },
         whitelistedCreatorsByCreator,
         auctionSettings,
         safetyDepositDrafts,
@@ -518,10 +524,12 @@ export const AuctionCreateView = () => {
         storeIndexer,
       );
     } catch (e: any) {
-      setRejection(r => r ?? { type: 'misc-error', inner: e });
+      const rej: SendAndConfirmError = { type: 'misc-error', inner: e };
+      setRejection(r => r ?? rej);
+      tmpRejection ??= rej;
     }
 
-    if (rejection) {
+    if (tmpRejection) {
       Bugsnag.notify({
         name: 'createAuctionManager failure',
         message: JSON.stringify(rejection),
